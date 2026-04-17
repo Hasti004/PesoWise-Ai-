@@ -1,0 +1,92 @@
+# PesoWise Robots.txt
+# Smart Petty Cash Management & Expense Tracking Software by Unimisk
+# Optimized for search engines and AI crawlers
+
+# Allow all search engines and AI crawlers
+User-agent: *
+Allow: /
+Allow: /home
+Allow: /auth
+
+# Disallow private/admin routes and authenticated pages
+User-agent: *
+Disallow: /admin/
+Disallow: /dashboard
+Disallow: /expenses/*/edit
+Disallow: /expenses/new
+Disallow: /api/
+Disallow: /settings
+Disallow: /notifications
+Disallow: /review
+Disallow: /balances
+Disallow: /cashier/
+
+# Allow specific AI crawlers and search engines
+User-agent: Googlebot
+Allow: /
+Crawl-delay: 0
+
+User-agent: Googlebot-Image
+Allow: /
+Crawl-delay: 0
+
+User-agent: Bingbot
+Allow: /
+Crawl-delay: 1
+
+User-agent: Slurp
+Allow: /
+Crawl-delay: 1
+
+# AI/LLM Crawlers (Generative Engine Optimization)
+User-agent: GPTBot
+Allow: /
+Crawl-delay: 1
+
+User-agent: ChatGPT-User
+Allow: /
+Crawl-delay: 1
+
+User-agent: CCBot
+Allow: /
+Crawl-delay: 1
+
+User-agent: anthropic-ai
+Allow: /
+Crawl-delay: 1
+
+User-agent: Claude-Web
+Allow: /
+Crawl-delay: 1
+
+User-agent: PerplexityBot
+Allow: /
+Crawl-delay: 1
+
+User-agent: Applebot-Extended
+Allow: /
+Crawl-delay: 1
+
+# Social Media Crawlers
+User-agent: Twitterbot
+Allow: /
+Crawl-delay: 0
+
+User-agent: facebookexternalhit
+Allow: /
+Crawl-delay: 0
+
+User-agent: LinkedInBot
+Allow: /
+Crawl-delay: 0
+
+User-agent: WhatsApp
+Allow: /
+Crawl-delay: 0
+
+# Sitemap location
+Sitemap: https://pesowise.com/sitemap.xml
+
+# Default crawl delay for other bots
+User-agent: *
+Crawl-delay: 1

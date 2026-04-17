@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { Bot, CheckCircle2, ImageIcon, Loader2, Send, Sparkles, User, X } from "lucide-react";
+import { flushSync } from "react-dom";
+import { useNavigate } from "react-router-dom";
+import { Bot, CheckCircle2, ImageIcon, Loader2, LogIn, Send, Sparkles, User, X } from "lucide-react";
+import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { AIParsedExpense, AIConversationMessage, AIService } from "@/services/AIService";
+import { AIParsedExpense, AIConversationMessage, AIService, OrgFormSchema, CustomFieldDef } from "@/services/AIService";
 import { ExpenseService } from "@/services/ExpenseService";
 import { useAuth } from "@/contexts/AuthContext";
 import { useToast } from "@/hooks/use-toast";
@@ -26,6 +29,114 @@ interface AIAssistantModalProps {
 const WELCOME_MESSAGE =
   "Hi! Describe your expense or upload a bill photo (printed or handwritten) and I'll help you log it. I'll ask for any missing details along the way.";
 
+const MAX_ORIGINAL_FILE_BYTES = 12 * 1024 * 1024; // before resize; server limit is 4 MB decoded after base64
+
+type ConversationBillImage = {
+  data: string;
+  mimeType: string;
+};
+
+/** Downscale large photos so the edge function/Gemini get a smaller payload (avoids timeouts & 413). */
+async function prepareBillImageForAi(file: File): Promise<{
+  data: string;
+  mimeType: string;
+  preview: string;
+}> {
+  const asDataUrl = (): Promise<{ data: string; mimeType: string; preview: string }> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const mimeType = dataUrl.match(/:(.*?);/)?.[1] || "image/jpeg";
+        const data = dataUrl.split(",")[1];
+        resolve({ data, mimeType, preview: dataUrl });
+      };
+      reader.onerror = () => reject(new Error("read"));
+      reader.readAsDataURL(file);
+    });
+
+  if (!file.type.startsWith("image/")) {
+    throw new Error("Please choose an image file.");
+  }
+  if (file.size > MAX_ORIGINAL_FILE_BYTES) {
+    throw new Error("Image is too large. Use a photo under 12 MB.");
+  }
+
+  const tryCanvasJpeg = async (): Promise<{ data: string; mimeType: string; preview: string } | null> => {
+    if (!/^image\/(jpeg|jpg|png|webp)$/i.test(file.type)) return null;
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error("decode"));
+        el.src = url;
+      });
+      const maxDim = 2048;
+      let w = img.naturalWidth;
+      let h = img.naturalHeight;
+      if (!w || !h) return null;
+      if (w > maxDim || h > maxDim) {
+        if (w >= h) {
+          h = Math.round((h * maxDim) / w);
+          w = maxDim;
+        } else {
+          w = Math.round((w * maxDim) / h);
+          h = maxDim;
+        }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, w, h);
+      const blob = await new Promise<Blob | null>((res) =>
+        canvas.toBlob((b) => res(b), "image/jpeg", 0.88),
+      );
+      if (!blob || blob.size > 4 * 1024 * 1024) return null;
+      const preview = await new Promise<string>((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(r.result as string);
+        r.onerror = () => reject(new Error("read"));
+        r.readAsDataURL(blob);
+      });
+      return {
+        data: preview.split(",")[1],
+        mimeType: "image/jpeg",
+        preview,
+      };
+    } catch {
+      return null;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  const resized = await tryCanvasJpeg();
+  if (resized) return resized;
+
+  return asDataUrl();
+}
+
+function extFromMimeType(mimeType: string): string {
+  const m = (mimeType || "").toLowerCase();
+  if (m.includes("png")) return "png";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  return "jpg";
+}
+
+function base64ToBlob(base64: string, mimeType: string): Blob {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mimeType || "image/jpeg" });
+}
+
 function formatExpenseSummary(expense: AIParsedExpense): string {
   const amount = expense.amount != null
     ? `₹${expense.amount.toLocaleString("en-IN")}`
@@ -44,12 +155,29 @@ function formatExpenseSummary(expense: AIParsedExpense): string {
     "I've collected all the details. Here's what I'll submit:",
     "",
     `📋 Title: ${expense.title}`,
-    `📍 Location: ${expense.destination}`,
+  ];
+
+  if (expense.category === "travel" && expense.trip_from && expense.trip_to) {
+    lines.push(`🚗 From: ${expense.trip_from}`);
+    lines.push(`📍 To: ${expense.trip_to}`);
+  } else {
+    lines.push(`📍 Location: ${expense.destination}`);
+  }
+
+  lines.push(
     `💰 Amount: ${amount}`,
     `📅 Date: ${date}`,
     `🏷️ Category: ${category}`,
-  ];
+  );
   if (expense.purpose) lines.push(`📝 Purpose: ${expense.purpose}`);
+
+  if (expense.custom_fields && Object.keys(expense.custom_fields).length > 0) {
+    lines.push("", "--- Additional Details ---");
+    for (const [name, value] of Object.entries(expense.custom_fields)) {
+      if (value) lines.push(`   ${name}: ${value}`);
+    }
+  }
+
   lines.push("", "Tap Submit Expense to send directly, or Review in Form to make changes first.");
   return lines.join("\n");
 }
@@ -59,10 +187,12 @@ export function AIAssistantModal({
   onOpenChange,
   onExpenseParsed,
 }: AIAssistantModalProps) {
-  const { user } = useAuth();
+  const { user, organizationId } = useAuth();
   const { toast } = useToast();
+  const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     { role: "assistant", content: WELCOME_MESSAGE },
@@ -86,6 +216,8 @@ export function AIAssistantModal({
   } | null>(null);
 
   const [pendingExpense, setPendingExpense] = useState<AIParsedExpense | null>(null);
+  const [loadingHint, setLoadingHint] = useState("");
+  const [orgFormSchema, setOrgFormSchema] = useState<OrgFormSchema | null>(null);
 
   // Reset everything when the modal opens
   useEffect(() => {
@@ -98,37 +230,90 @@ export function AIAssistantModal({
       setConversationImage(null);
       setPendingImage(null);
       setPendingExpense(null);
+      setSessionExpired(false);
+      setOrgFormSchema(null);
+
+      // Fetch all custom form fields for the organization upfront
+      if (organizationId) {
+        (async () => {
+          try {
+            const { data, error } = await supabase
+              .from("expense_category_form_fields")
+              .select(`
+                template:expense_form_field_templates!inner(id, name, field_type, required, options, help_text),
+                required,
+                category:expense_categories!inner(name)
+              `)
+              .eq("organization_id", organizationId);
+
+            if (error || !data) return;
+
+            const schema: OrgFormSchema = {};
+            for (const row of data as any[]) {
+              const catName = row.category?.name;
+              if (!catName) continue;
+              const lowerCat = catName.toLowerCase();
+              if (!schema[lowerCat]) schema[lowerCat] = [];
+              schema[lowerCat].push({
+                template_id: row.template?.id,
+                name: row.template?.name,
+                field_type: row.template?.field_type,
+                required: row.required ?? row.template?.required ?? false,
+                options: row.template?.options ?? undefined,
+                help_text: row.template?.help_text ?? undefined,
+              });
+            }
+            setOrgFormSchema(Object.keys(schema).length > 0 ? schema : null);
+          } catch {
+            // Non-critical — AI will just work without custom field awareness
+          }
+        })();
+      }
     }
-  }, [open]);
+  }, [open, organizationId]);
 
   // Scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  const onImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    if (file.size > 4 * 1024 * 1024) {
-      toast({
-        variant: "destructive",
-        title: "Image too large",
-        description: "Please select an image smaller than 4 MB.",
-      });
-      e.target.value = "";
+  useEffect(() => {
+    if (!loading) {
+      setLoadingHint("");
       return;
     }
-
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const dataUrl = ev.target?.result as string;
-      const mimeType = dataUrl.match(/:(.*?);/)?.[1] || "image/jpeg";
-      const data = dataUrl.split(",")[1];
-      setPendingImage({ data, mimeType, preview: dataUrl });
+    const slow = window.setTimeout(() => setLoadingHint("Still working…"), 7000);
+    const slower = window.setTimeout(() => setLoadingHint("Large images or long chats take longer. You can retry if this stalls."), 20000);
+    return () => {
+      window.clearTimeout(slow);
+      window.clearTimeout(slower);
     };
-    reader.readAsDataURL(file);
+  }, [loading]);
+
+  const onImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
     e.target.value = "";
+
+    try {
+      const prepared = await prepareBillImageForAi(file);
+      const estDecoded = Math.floor((prepared.data.length * 3) / 4);
+      if (estDecoded > 4 * 1024 * 1024) {
+        toast({
+          variant: "destructive",
+          title: "Image still too large",
+          description: "Try a smaller photo or screenshot the receipt.",
+        });
+        return;
+      }
+      setPendingImage(prepared);
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Could not use this image",
+        description: err instanceof Error ? err.message : "Try JPEG or PNG.",
+      });
+    }
   };
 
   const removePendingImage = () => setPendingImage(null);
@@ -163,13 +348,24 @@ export function AIAssistantModal({
     };
     const updatedHistory: AIConversationMessage[] = [...conversationHistory, newUserHistoryMsg];
 
-    setMessages((prev) => [...prev, userDisplayMsg]);
-    setConversationHistory(updatedHistory);
-    setLoading(true);
+    // Paint user message immediately so the UI feels responsive before the edge function runs.
+    flushSync(() => {
+      setMessages((prev) => [...prev, userDisplayMsg]);
+      setConversationHistory(updatedHistory);
+      setLoading(true);
+    });
 
-    const result = await AIService.sendConversationalMessage(updatedHistory, imageToSend ?? undefined);
+    const result = await AIService.sendConversationalMessage(
+      updatedHistory,
+      imageToSend ?? undefined,
+      orgFormSchema ?? undefined,
+    );
 
     if ("error" in result) {
+      const isSessionError =
+        result.error.toLowerCase().includes("session") ||
+        result.error.toLowerCase().includes("sign in");
+      if (isSessionError) setSessionExpired(true);
       setMessages((prev) => [...prev, { role: "assistant", content: result.error }]);
       setLoading(false);
       return;
@@ -195,6 +391,48 @@ export function AIAssistantModal({
     setLoading(false);
   };
 
+  const attachConversationBillToExpense = async (
+    expenseId: string,
+    expenseOrgId: string,
+    image: ConversationBillImage,
+  ) => {
+    if (!user?.id) throw new Error("User not authenticated.");
+    const ext = extFromMimeType(image.mimeType);
+    const filename = `ai-bill-${Date.now()}.${ext}`;
+    const storagePath = `${expenseId}/${filename}`;
+    const blob = base64ToBlob(image.data, image.mimeType);
+    const file = new File([blob], filename, { type: image.mimeType || "image/jpeg" });
+
+    const { error: uploadError } = await supabase.storage
+      .from("receipts")
+      .upload(storagePath, file, { cacheControl: "3600", upsert: false });
+    if (uploadError) {
+      throw new Error(`Failed to upload AI bill image: ${uploadError.message}`);
+    }
+
+    const { data: urlData } = supabase.storage.from("receipts").getPublicUrl(storagePath);
+    const fileUrl = urlData?.publicUrl;
+    if (!fileUrl) {
+      throw new Error("Failed to generate bill image URL.");
+    }
+
+    const { error: attachmentError } = await supabase
+      .from("attachments")
+      .insert({
+        expense_id: expenseId,
+        organization_id: expenseOrgId,
+        file_url: fileUrl,
+        filename,
+        content_type: file.type || "image/jpeg",
+        uploaded_by: user.id,
+        file_size: file.size,
+      });
+
+    if (attachmentError) {
+      throw new Error(`Failed to create attachment record: ${attachmentError.message}`);
+    }
+  };
+
   const onSubmitExpense = async () => {
     if (!pendingExpense || !user) return;
     setPhase("submitting");
@@ -218,6 +456,15 @@ export function AIAssistantModal({
         amount: pendingExpense.amount!,
         category: pendingExpense.category,
       });
+
+      // If user already uploaded bill image in AI chat, reuse it as the official receipt attachment.
+      if (conversationImage) {
+        const expenseOrgId = (newExpense as any).organization_id || organizationId;
+        if (!expenseOrgId) {
+          throw new Error("Expense organization not found for receipt attachment.");
+        }
+        await attachConversationBillToExpense(newExpense.id, expenseOrgId, conversationImage);
+      }
 
       await ExpenseService.submitExpense(newExpense.id, user.id);
 
@@ -318,14 +565,38 @@ export function AIAssistantModal({
             ))}
 
             {loading && (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Thinking…
+              <div className="flex flex-col gap-0.5">
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin shrink-0" />
+                  <span>Thinking…</span>
+                </div>
+                {loadingHint ? (
+                  <p className="pl-6 text-xs text-muted-foreground/90">{loadingHint}</p>
+                ) : null}
               </div>
             )}
 
             <div ref={messagesEndRef} />
           </div>
+
+          {/* ── Session expired banner ── */}
+          {sessionExpired && (
+            <div className="flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <span>Your session has expired.</span>
+              <Button
+                size="sm"
+                variant="destructive"
+                onClick={async () => {
+                  await supabase.auth.signOut(); // clear the bad session from localStorage
+                  onOpenChange(false);
+                  navigate("/auth");
+                }}
+              >
+                <LogIn className="mr-1.5 h-3.5 w-3.5" />
+                Sign In Again
+              </Button>
+            </div>
+          )}
 
           {/* ── Confirm / Done action buttons ── */}
           {(phase === "confirming" || phase === "submitting") && pendingExpense && (

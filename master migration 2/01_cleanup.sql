@@ -1,0 +1,39 @@
+-- Function: Remove previous objects safely for a clean rebuild.
+
+DO $$
+BEGIN
+  DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+  DROP TRIGGER IF EXISTS update_expense_total_on_line_item ON public.expense_line_items;
+  DROP TRIGGER IF EXISTS update_notifications_updated_at ON public.notifications;
+  DROP TRIGGER IF EXISTS trigger_assign_transaction_number ON public.expenses;
+  DROP TRIGGER IF EXISTS enforce_engineer_approval_limit ON public.expenses;
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+
+DO $$
+BEGIN
+  BEGIN DROP TABLE IF EXISTS public.money_return_requests CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.engineer_locations CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.locations CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.money_assignments CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.notifications CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.settings CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.organization_transaction_sequences CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.organization_settings CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.organization_memberships CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.organizations CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.audit_logs CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.attachments CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.expense_line_items CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.expenses CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.expense_categories CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.user_roles CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+  BEGIN DROP TABLE IF EXISTS public.profiles CASCADE; EXCEPTION WHEN OTHERS THEN NULL; END;
+END $$;
+
+DROP TYPE IF EXISTS public.expense_category_v2 CASCADE;
+DROP TYPE IF EXISTS public.expense_status CASCADE;
+DROP TYPE IF EXISTS public.app_role CASCADE;
+
+DELETE FROM storage.buckets WHERE id IN ('receipts', 'expense-attachments', 'organization-logos');

@@ -88,11 +88,11 @@ export default function Balances() {
   }, [userRole, user?.id]);
 
   useEffect(() => {
-    if (activeTab === "history" && user && (userRole === "admin" || userRole === "cashier")) {
+    if (activeTab === "history" && user && organizationId && (userRole === "admin" || userRole === "cashier")) {
       fetchTransferHistory();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, user?.id, userRole]);
+  }, [activeTab, user?.id, userRole, organizationId]);
 
   useEffect(() => {
     if (activeTab === "history") {
@@ -876,14 +876,14 @@ export default function Balances() {
   };
 
   const fetchTransferHistory = async () => {
-    if (!user?.id) return;
+    if (!user?.id || !organizationId) return;
     try {
       setTransferHistoryLoading(true);
       
       let query = supabase
         .from("cash_transfer_history")
         .select("*")
-        .eq("organization_id", organizationId || "")
+        .eq("organization_id", organizationId)
         .order("transferred_at", { ascending: false });
 
       if (userRole === "cashier") {
@@ -915,6 +915,7 @@ export default function Balances() {
         const { data: profiles } = await supabase
           .from("profiles")
           .select("user_id, name")
+          .eq("organization_id", organizationId)
           .in("user_id", Array.from(userIds));
 
         const nameMap = new Map(profiles?.map((p) => [p.user_id, p.name]) || []);

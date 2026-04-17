@@ -1,0 +1,22 @@
+project_id = "avrbgpmzabktqwyzqibq"
+
+# ── parse-expense / Gemini (IMPORTANT) ─────────────────────────────────────
+# The browser NEVER sends your Gemini key. Only secrets available to Edge
+# Functions count. A key in .env at repo root is for Vite only and will NOT
+# fix "quota" / 429 errors from parse-expense.
+#
+# Set the live key on THE SAME Supabase project your app uses:
+#   Dashboard → Project Settings → Edge Functions → Secrets
+#   Name: GEMINI_API_KEY   Value: <AI Studio API key>
+# Or CLI:
+#   supabase secrets set GEMINI_API_KEY=your_key --project-ref avrbgpmzabktqwyzqibq
+#
+# A "new" key in the same Google AI Studio / Cloud project shares the SAME
+# quota as the old key. For 429: enable billing on that Google project or
+# use https://ai.google.dev/gemini-api/docs/rate-limits
+#
+# Optional secrets:
+#   GEMINI_CONVERSATIONAL_MODEL=gemini-2.0-flash
+#   GEMINI_USE_PRO_FALLBACK=1
+[functions.parse-expense]
+verify_jwt = false

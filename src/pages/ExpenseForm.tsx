@@ -27,6 +27,26 @@ import { AIParsedExpense } from "@/services/AIService";
 import { z } from "zod";
 // line items removed
 
+/** Path inside the receipts bucket, e.g. temp/{userId}/file.jpg */
+function receiptsPathFromPublicUrl(fileUrl: string): string | null {
+  try {
+    const raw = fileUrl.trim();
+    const u = raw.startsWith("http") ? new URL(raw) : new URL(raw, "http://local.invalid");
+    const pathname = u.pathname || raw;
+    const mark = "/receipts/";
+    const idx = pathname.indexOf(mark);
+    if (idx !== -1) {
+      const rest = pathname.slice(idx + mark.length);
+      return decodeURIComponent(rest.replace(/\+/g, " ")) || null;
+    }
+    const legacy = pathname.match(/\/object\/(?:public|sign)\/receipts\/(.+)$/i);
+    if (legacy?.[1]) return decodeURIComponent(legacy[1].replace(/\+/g, " "));
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 const expenseSchema = z.object({
   title: z.string().min(1, "Title is required"),
   destination: z.string().min(1, "Destination is required"),
@@ -122,8 +142,68 @@ export default function ExpenseForm() {
       purpose: parsed.purpose ?? prev.purpose,
     }));
 
+    let loadedFields: any[] = [];
     if (nextCategory) {
-      await fetchCategoryFormFields(nextCategory);
+      loadedFields = await fetchCategoryFormFields(nextCategory);
+    }
+
+    // Fill template form fields from AI-extracted travel data (trip_from / trip_to).
+    // We fuzzy-match template field names so admins can name them anything reasonable
+    // (e.g. "From", "From Location", "Travel From", "Origin", "Departure", etc.)
+    if (loadedFields.length > 0 && (parsed.trip_from || parsed.trip_to)) {
+      setFormFieldValues((prev) => {
+        const updated = { ...prev };
+        for (const field of loadedFields) {
+          const name = (field.template?.name || "").toLowerCase().trim();
+          if (parsed.trip_from) {
+            const isFrom =
+              name === "from" ||
+              name.startsWith("from ") ||
+              name.endsWith(" from") ||
+              name.includes("origin") ||
+              name.includes("departure") ||
+              name.includes("source") ||
+              name.includes("start location") ||
+              name === "travel from";
+            if (isFrom) updated[field.template.id] = parsed.trip_from;
+          }
+          if (parsed.trip_to) {
+            const isTo =
+              name === "to" ||
+              name.startsWith("to ") ||
+              name.endsWith(" to") ||
+              name.includes("arrival") ||
+              name === "destination" ||
+              name.includes("end location") ||
+              name === "travel to";
+            if (isTo) updated[field.template.id] = parsed.trip_to;
+          }
+        }
+        return updated;
+      });
+    }
+
+    // Fill custom fields from AI response (matched by field name, case-insensitive)
+    if (loadedFields.length > 0 && parsed.custom_fields && Object.keys(parsed.custom_fields).length > 0) {
+      setFormFieldValues((prev) => {
+        const updated = { ...prev };
+        for (const field of loadedFields) {
+          const templateId = field.template?.id;
+          const templateName = (field.template?.name || "").toLowerCase().trim();
+          if (!templateId) continue;
+
+          // Already filled by trip_from/trip_to matching above — don't overwrite
+          if (updated[templateId] && updated[templateId] !== (prev as any)[templateId]) continue;
+
+          for (const [aiFieldName, aiValue] of Object.entries(parsed.custom_fields!)) {
+            if (aiFieldName.toLowerCase().trim() === templateName) {
+              updated[templateId] = aiValue;
+              break;
+            }
+          }
+        }
+        return updated;
+      });
     }
 
     setAiMissingInfo(parsed.missingInfo);
@@ -218,13 +298,13 @@ export default function ExpenseForm() {
     }
   }, [id, organizationId]);
 
-  // Fetch form fields for selected category
-  const fetchCategoryFormFields = async (categoryName: string) => {
+  // Fetch form fields for selected category — returns loaded fields so callers can use them immediately
+  const fetchCategoryFormFields = async (categoryName: string): Promise<any[]> => {
     try {
       if (!organizationId || !categoryName) {
         setCategoryFormFields([]);
         setFormFieldValues({});
-        return;
+        return [];
       }
 
       // Get category ID
@@ -238,7 +318,7 @@ export default function ExpenseForm() {
       if (!categoryData) {
         setCategoryFormFields([]);
         setFormFieldValues({});
-        return;
+        return [];
       }
 
       // Get form field assignments for this category
@@ -271,9 +351,11 @@ export default function ExpenseForm() {
         }
       });
       setFormFieldValues(initialValues);
+      return fields;
     } catch (e: any) {
       console.error("Failed to fetch category form fields:", e);
       setCategoryFormFields([]);
+      return [];
     }
   };
 
@@ -410,75 +492,99 @@ export default function ExpenseForm() {
   // addLineItem removed
 
   const moveTempFilesToExpense = async (expenseId: string) => {
-    try {
-      if (!user?.id) {
-        console.error('User not authenticated');
-        return;
-      }
-      
-      if (!organizationId) {
-        console.error('Organization not found');
-        throw new Error('Organization not found');
-      }
+    if (!user?.id) {
+      throw new Error('User not authenticated');
+    }
 
-      // Get all temp files for this user
-      const { data: tempFiles, error: listError } = await supabase.storage
+    // Must match expenses.organization_id or RLS on attachments will reject the insert
+    // (AuthContext org can differ from membership used when creating the expense.)
+    const { data: expenseRow, error: expenseFetchError } = await supabase
+      .from('expenses')
+      .select('organization_id')
+      .eq('id', expenseId)
+      .single();
+
+    if (expenseFetchError || !expenseRow?.organization_id) {
+      console.error('Could not load expense for attachment move:', expenseFetchError);
+      throw expenseFetchError || new Error('Expense not found');
+    }
+
+    const expenseOrgId = expenseRow.organization_id;
+
+    const tempPrefix = `temp/${user.id}/`;
+
+    // Prefer listing temp objects; when RLS or API returns an empty list, fall back to paths
+    // parsed from public URLs already in form state (upload succeeded but list may be blocked).
+    const { data: tempFiles, error: listError } = await supabase.storage
+      .from('receipts')
+      .list(`temp/${user.id}`, {
+        limit: 100,
+        sortBy: { column: 'created_at', order: 'desc' }
+      });
+
+    if (listError) {
+      console.warn('Temp folder list failed (will use URL fallback if any):', listError);
+    }
+
+    const fromList = (tempFiles ?? [])
+      .filter((f) => f.name)
+      .map((f) => `${tempPrefix}${f.name}`);
+    const fromUrls = attachments
+      .map(receiptsPathFromPublicUrl)
+      .filter((p): p is string => !!p && p.startsWith(tempPrefix));
+    const uniqueTempPaths = [...new Set([...fromList, ...fromUrls])];
+
+    if (uniqueTempPaths.length === 0) return;
+
+    // Move each temp file to the expense folder
+    for (const tempPath of uniqueTempPaths) {
+      const fileName = tempPath.slice(tempPrefix.length);
+      if (!fileName) continue;
+
+      const newPath = `${expenseId}/${fileName}`;
+      const ext = fileName.split(".").pop()?.toLowerCase();
+      const contentType =
+        ext === "pdf"
+          ? "application/pdf"
+          : ext === "png"
+            ? "image/png"
+            : "image/jpeg";
+
+      // Copy file to new location
+      const { error: copyError } = await supabase.storage
         .from('receipts')
-        .list(`temp/${user.id}`, {
-          limit: 100,
-          sortBy: { column: 'created_at', order: 'desc' }
+        .copy(tempPath, newPath);
+
+      if (copyError) {
+        console.error('Error copying file:', copyError);
+        throw copyError;
+      }
+
+      // Create attachment record
+      const { data: urlData } = supabase.storage
+        .from('receipts')
+        .getPublicUrl(newPath);
+
+      const { error: attachmentInsertError } = await supabase
+        .from('attachments')
+        .insert({
+          expense_id: expenseId,
+          organization_id: expenseOrgId,
+          file_url: urlData?.publicUrl || '',
+          filename: fileName,
+          content_type: contentType,
+          uploaded_by: user.id
         });
-
-      if (listError) {
-        console.error('Error listing temp files:', listError);
-        return;
+      
+      if (attachmentInsertError) {
+        console.error('Error creating attachment record:', attachmentInsertError);
+        throw attachmentInsertError;
       }
 
-      if (!tempFiles || tempFiles.length === 0) return;
-
-      // Move each temp file to the expense folder
-      for (const file of tempFiles) {
-        const tempPath = `temp/${user.id}/${file.name}`;
-        const newPath = `${expenseId}/${file.name}`;
-
-        // Copy file to new location
-        const { data: copyData, error: copyError } = await supabase.storage
-          .from('receipts')
-          .copy(tempPath, newPath);
-
-        if (copyError) {
-          console.error('Error copying file:', copyError);
-          continue;
-        }
-
-        // Create attachment record
-        const { data: urlData } = supabase.storage
-          .from('receipts')
-          .getPublicUrl(newPath);
-
-        const { error: attachmentInsertError } = await supabase
-          .from('attachments')
-          .insert({
-            expense_id: expenseId,
-            organization_id: organizationId,
-            file_url: urlData?.publicUrl || '',
-            filename: file.name || 'unknown',
-            content_type: file.metadata?.mimetype || 'image/jpeg',
-            uploaded_by: user.id
-          });
-        
-        if (attachmentInsertError) {
-          console.error('Error creating attachment record:', attachmentInsertError);
-          throw attachmentInsertError;
-        }
-
-        // Delete temp file
-        await supabase.storage
-          .from('receipts')
-          .remove([tempPath]);
-      }
-    } catch (error) {
-      console.error('Error moving temp files:', error);
+      // Delete temp file
+      await supabase.storage
+        .from('receipts')
+        .remove([tempPath]);
     }
   };
 

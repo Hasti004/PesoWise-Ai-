@@ -14,10 +14,22 @@ type ExpenseCategory = (typeof ALLOWED_CATEGORIES)[number];
 
 type ConversationMessage = { role: "user" | "assistant"; content: string };
 
+type CustomFieldDef = {
+  template_id: string;
+  name: string;
+  field_type: string;
+  required: boolean;
+  options?: string[];
+  help_text?: string;
+};
+
+type OrgFormSchema = Record<string, CustomFieldDef[]>;
+
 type ParseExpenseBody = {
   // Conversational format
   messages?: ConversationMessage[];
   image?: { data: string; mimeType: string };
+  orgFormSchema?: OrgFormSchema;
   // Legacy single-message format
   message?: string;
 };
@@ -25,18 +37,22 @@ type ParseExpenseBody = {
 type ParsedExpense = {
   title: string;
   destination: string;
+  trip_from: string | null;
+  trip_to: string | null;
   amount: number | null;
   category: ExpenseCategory;
   expense_date: string | null;
   purpose: string | null;
   missingInfo: string | null;
+  custom_fields?: Record<string, string>;
 };
 
 type ConversationalResponse =
   | { status: "collecting"; question: string }
   | { status: "complete"; expense: ParsedExpense };
 
-const GEMINI_MODELS = [
+/** Legacy single-message mode: flash-first, then slower fallbacks. */
+const GEMINI_LEGACY_MODELS = [
   "gemini-2.0-flash",
   "gemini-2.5-flash",
   "gemini-flash-latest",
@@ -45,11 +61,89 @@ const GEMINI_MODELS = [
   "gemini-pro-latest",
 ];
 
+/**
+ * Multi-turn chat: use ONLY fast Flash models by default.
+ * Trying many models × many retries often exceeds the edge gateway (~60s) → 502 GEMINI_FAILURE.
+ * Override with env GEMINI_CONVERSATIONAL_MODEL or GEMINI_MODEL (single id).
+ */
+const GEMINI_CONVERSATIONAL_FLASH = [
+  "gemini-2.0-flash",
+  "gemini-2.5-flash",
+  "gemini-flash-latest",
+];
+
+/** One slow fallback only if every flash model failed (optional). */
+const GEMINI_CONVERSATIONAL_FALLBACK = ["gemini-2.5-pro"];
+
 const MAX_MESSAGE_LENGTH = 1500;
-const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4 MB base64
+/** Decoded (binary) image size limit; base64 is ~4/3 larger — do not compare raw char length to this. */
+const MAX_IMAGE_BINARY_BYTES = 4 * 1024 * 1024;
+/** Stay under typical edge / CDN limits; fail fast and try next model. */
+const GEMINI_REQUEST_TIMEOUT_MS = 48_000;
+const MAX_CONVERSATION_MESSAGES = 18;
+
+/** Raised when Google returns quota/billing exhaustion — retrying other models won't help. */
+class GeminiQuotaExceededError extends Error {
+  constructor(detail: string) {
+    super(detail);
+    this.name = "GeminiQuotaExceededError";
+  }
+}
+
+/** Too many requests in a short window (RPM) — distinct from daily quota / billing. */
+class GeminiRateLimitedError extends Error {
+  constructor(detail: string) {
+    super(detail);
+    this.name = "GeminiRateLimitedError";
+  }
+}
+
+/** Pull message string from Gemini REST error JSON (`{ "error": { "message": "..." } }`). */
+function parseGeminiErrorMessage(bodyText: string): string {
+  try {
+    const j = JSON.parse(bodyText);
+    const m = j?.error?.message;
+    if (typeof m === "string") return m;
+  } catch {
+    /* plain text */
+  }
+  return bodyText;
+}
+
+/**
+ * True when Google explicitly indicates plan/daily quota/billing (not just RPM throttling).
+ * "resource exhausted" alone is used for per-minute limits too — do NOT treat as hard quota.
+ */
+function isHardGeminiQuotaExceeded(bodyText: string): boolean {
+  const t = parseGeminiErrorMessage(bodyText).toLowerCase();
+  return (
+    t.includes("exceeded your current quota") ||
+    t.includes("quota exceeded") ||
+    t.includes("check your plan and billing") ||
+    (t.includes("billing") &&
+      (t.includes("enable") || t.includes("not been enabled") || t.includes("details"))) ||
+    t.includes("generate_requests_per_day") ||
+    (t.includes("free tier") && t.includes("limit"))
+  );
+}
 
 const json = (status: number, payload: Record<string, unknown>) =>
   new Response(JSON.stringify(payload), { status, headers: corsHeaders });
+
+/**
+ * User-facing help when Google returns 429. New API keys often confuse this:
+ * - Keys must live in Supabase Edge secrets, not Vite .env.
+ * - Keys in the same Google Cloud / AI Studio project share one quota bucket.
+ */
+const USER_MESSAGE_GEMINI_QUOTA =
+  "Google says this API key exceeded quota or billing limits (not a “random” 429). " +
+  "The key that actually runs in production is only GEMINI_API_KEY in Supabase → Project Settings → Edge Functions → Secrets. " +
+  "If you switched Google accounts: open the function logs for parse-expense right after a failure — we log the first 10 characters of the key in use; they must match your new key from AI Studio. " +
+  "If they match and you still see this, enable billing or raise limits: https://ai.google.dev/gemini-api/docs/rate-limits";
+
+const USER_MESSAGE_GEMINI_RATE_LIMIT =
+  "Gemini returned too many requests in a short time (HTTP 429 rate limit). Wait about one minute and try again. " +
+  "If it happens on every first message, check Supabase Edge secrets: the app may still be using an old GEMINI_API_KEY.";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -65,12 +159,89 @@ function cleanupJsonText(raw: string): string {
   return fenceMatch ? fenceMatch[1].trim() : trimmed;
 }
 
+/** Upper bound on decoded byte size from base64 string (ignoring padding nuance). */
+function approxDecodedBase64Bytes(b64: string): number {
+  return Math.floor((b64.length * 3) / 4);
+}
+
+/** Gemini expects image/jpeg, image/png, etc. */
+function normalizeImageMimeType(mime: string): string {
+  const m = (mime || "").split(";")[0].trim().toLowerCase();
+  if (m === "image/jpg") return "image/jpeg";
+  if (m === "image/pjpeg") return "image/jpeg";
+  if (
+    m === "image/jpeg" ||
+    m === "image/png" ||
+    m === "image/webp" ||
+    m === "image/gif"
+  ) {
+    return m;
+  }
+  return "image/jpeg";
+}
+
+/** Vision models often prepend text; find first balanced JSON object. */
+function extractBalancedJsonObject(s: string): string | null {
+  const start = s.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (c === "\\" && inString) {
+      escape = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function parseJsonFromModelText(raw: string): any | null {
+  const cleaned = cleanupJsonText(raw);
+  const candidates: string[] = [cleaned];
+  const balanced = extractBalancedJsonObject(cleaned);
+  if (balanced && balanced !== cleaned) candidates.push(balanced);
+  for (const s of candidates) {
+    try {
+      return JSON.parse(s);
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
 function extractGeminiText(result: any): string {
   const partText = result?.candidates?.[0]?.content?.parts
     ?.map((p: any) => (typeof p?.text === "string" ? p.text : ""))
     .join("")
     ?.trim();
   return partText || "";
+}
+
+function geminiBlockedReason(result: any): string | null {
+  const fr = result?.candidates?.[0]?.finishReason;
+  // Truncated output may still contain parseable JSON — try parsing before failing.
+  if (fr === "MAX_TOKENS") return null;
+  if (fr && fr !== "STOP") return `finish:${fr}`;
+  const br = result?.promptFeedback?.blockReason;
+  if (br) return `blocked:${br}`;
+  return null;
 }
 
 function normalizeDate(value: unknown): string | null {
@@ -105,6 +276,21 @@ function normalizeDestination(value: unknown): string {
   return trimmed ? trimmed : "Not-Specified";
 }
 
+/** True when we should keep collecting — model/user gave no usable place/vendor/city. */
+function isDestinationUnset(destination: string): boolean {
+  const d = destination.trim().toLowerCase();
+  if (!d) return true;
+  return (
+    d === "not-specified" ||
+    d === "not specified" ||
+    d === "n/a" ||
+    d === "na" ||
+    d === "unknown" ||
+    d === "none" ||
+    d === "unspecified"
+  );
+}
+
 function normalizeText(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -118,17 +304,36 @@ function normalizeTitle(value: unknown, fallbackMessage: string): string {
 
 function normalizeParsedExpense(parsed: any, fallbackMessage: string): ParsedExpense {
   const amount = normalizeAmount(parsed?.amount);
-  const destination = normalizeDestination(parsed?.destination);
   const category = normalizeCategory(parsed?.category);
   const expense_date = normalizeDate(parsed?.expense_date);
   const purpose = normalizeText(parsed?.purpose);
   const title = normalizeTitle(parsed?.title, fallbackMessage);
+  const trip_from = normalizeText(parsed?.trip_from);
+  const trip_to = normalizeText(parsed?.trip_to);
+
+  // For travel, build destination from trip_from/trip_to when not already set
+  let destination = normalizeDestination(parsed?.destination);
+  if (category === "travel" && trip_from && trip_to && isDestinationUnset(destination)) {
+    destination = `${trip_from} to ${trip_to}`;
+  }
 
   let missingInfo = normalizeText(parsed?.missingInfo);
   if (!amount && !missingInfo) missingInfo = "Amount is missing or unclear.";
   if (destination === "Not-Specified" && !missingInfo) missingInfo = "Destination or vendor was not detected.";
 
-  return { title, destination, amount, category, expense_date, purpose, missingInfo };
+  // Preserve custom_fields if present
+  let custom_fields: Record<string, string> | undefined;
+  if (parsed?.custom_fields && typeof parsed.custom_fields === "object") {
+    custom_fields = {};
+    for (const [key, val] of Object.entries(parsed.custom_fields)) {
+      if (val != null && String(val).trim()) {
+        custom_fields[key] = String(val).trim();
+      }
+    }
+    if (Object.keys(custom_fields).length === 0) custom_fields = undefined;
+  }
+
+  return { title, destination, trip_from, trip_to, amount, category, expense_date, purpose, missingInfo, custom_fields };
 }
 
 // ─── Legacy single-turn prompt ────────────────────────────────────────────────
@@ -139,10 +344,13 @@ function buildLegacyPrompt(message: string): string {
     "You are an expense extraction assistant.",
     "Return ONLY raw JSON. No markdown. No code fences. No extra text.",
     `Today's date is ${today}. Resolve relative dates like 'today', 'yesterday', 'last Friday' accordingly.`,
+    "Categories: travel = ANY transport (driver hire, cab, fuel, flight, train, bus, auto, toll); lodging = hotel/accommodation; food = meals/restaurant; other = everything else.",
     "Output schema:",
     "{",
     '  "title": "short descriptive title",',
-    '  "destination": "location mentioned or Not-Specified",',
+    '  "destination": "for travel: \'From to To\'; for others: vendor/location or Not-Specified",',
+    '  "trip_from": "origin city/place if travel, else null",',
+    '  "trip_to": "destination city/place if travel, else null",',
     '  "amount": number or null,',
     '  "category": "travel" | "lodging" | "food" | "other",',
     '  "expense_date": "YYYY-MM-DD" or null,',
@@ -150,6 +358,7 @@ function buildLegacyPrompt(message: string): string {
     '  "missingInfo": "string" or null',
     "}",
     "Rules:",
+    "- For travel: set trip_from and trip_to if mentioned; set destination = trip_from + ' to ' + trip_to.",
     "- If destination is not explicit, set destination to Not-Specified.",
     "- If amount is not explicit, set amount to null.",
     "- If category is unclear, set category to other.",
@@ -162,50 +371,77 @@ function buildLegacyPrompt(message: string): string {
 
 // ─── Conversational system instruction ────────────────────────────────────────
 
-function buildSystemInstruction(today: string, ocrText?: string): string {
+function buildSystemInstruction(today: string, ocrText?: string, orgFormSchema?: OrgFormSchema): string {
   const lines = [
-    "You are a friendly AI assistant helping users log expense claims through conversation.",
-    `Today's date is ${today}.`,
+    "You help users log expense claims (INR). Be brief and warm.",
+    `Today: ${today}. Resolve relative dates to YYYY-MM-DD.`,
     "",
-    "Your goal is to collect these fields through natural conversation:",
-    "- title: short descriptive title (REQUIRED – auto-generate from context if not stated)",
-    "- destination: vendor or location name (default to Not-Specified if not mentioned)",
-    "- amount: total expense amount in Indian Rupees (REQUIRED)",
-    "- category: one of travel | lodging | food | other (default other)",
-    `- expense_date: date in YYYY-MM-DD format (default to ${today} if not mentioned)`,
-    "- purpose: brief reason for the expense (optional)",
+    "CATEGORIES — classify strictly:",
+    "- travel: ANY transport/movement expense — driver hire, car/auto/cab/taxi rental, Ola/Uber/rickshaw, fuel/petrol/diesel, flight, train, bus, toll, parking, vehicle hire, commute",
+    "- lodging: overnight stay — hotel, hostel, guest house, dharamshala, accommodation, room booking",
+    "- food: meals, snacks, drinks — restaurant, canteen, cafeteria, dhaba, food delivery, tea/coffee shop",
+    "- other: everything else (stationery, medical, miscellaneous, shopping)",
     "",
+    "FIELDS to collect:",
+    "- title: short descriptive title (infer from context; e.g. 'Driver Hire – Mumbai to Pune')",
+    "- destination: main location/vendor. For travel: use 'FromPlace to ToPlace' format. For others: restaurant/shop name or city.",
+    "- trip_from: origin place — ONLY for travel category (city, area, or landmark). Set null for all other categories.",
+    "- trip_to: destination place — ONLY for travel category. Set null for all other categories.",
+    "- amount: INR number (required)",
+    "- category: travel|lodging|food|other",
+    "- expense_date: YYYY-MM-DD (default today if not specified)",
+    "- purpose: brief reason (optional)",
+    "",
+    "TRAVEL RULE: When category is travel you MUST collect BOTH trip_from and trip_to before completing. If either is missing, ask: 'Where did you travel from, and where to?' Do not mark complete until both are provided.",
+    "DESTINATION RULE: For travel set destination = trip_from + ' to ' + trip_to. For food/lodging/other use the vendor or location name — never 'Not-Specified' unless user explicitly says unknown.",
   ];
 
   if (ocrText) {
     lines.push(
-      "A bill/receipt image was uploaded. The following text was extracted from it (may include handwriting):",
-      "--- BEGIN BILL TEXT ---",
-      ocrText.slice(0, 1500),
-      "--- END BILL TEXT ---",
       "",
-      "Use this extracted text as your primary source for the expense fields.",
-      "If numbers are marked with '?' they were uncertain – ask the user to confirm them.",
+      "Bill OCR text (prefer this for amounts and dates):",
+      ocrText.slice(0, 1200),
       "",
+      "If an OCR number is unclear (marked '?'), ask one short confirm question.",
+    );
+  }
+
+  // Inject organization custom fields if available
+  if (orgFormSchema && Object.keys(orgFormSchema).length > 0) {
+    lines.push(
+      "",
+      "ORGANIZATION CUSTOM FIELDS (by category):",
+      "These are additional fields the organization requires. After determining the category, check its custom fields below.",
+      "Extract values from the OCR text or user messages when possible. For REQUIRED custom fields you cannot determine, ASK the user.",
+      "Do NOT guess or make up values — only fill what you are confident about from the bill or conversation.",
+      "For optional fields you cannot determine, skip them (do not ask).",
+    );
+    for (const [cat, fields] of Object.entries(orgFormSchema)) {
+      if (fields.length === 0) continue;
+      lines.push(`  ${cat}:`);
+      for (const f of fields) {
+        let desc = `    - "${f.name}" (${f.field_type}${f.required ? ", REQUIRED" : ", optional"})`;
+        if (f.options?.length) desc += ` [options: ${f.options.join(", ")}]`;
+        if (f.help_text) desc += ` — ${f.help_text}`;
+        lines.push(desc);
+      }
+    }
+    lines.push(
+      "",
+      'When complete, include "custom_fields" in the expense JSON mapping field names to values:',
+      '"custom_fields": {"Field Name": "value", ...}',
+      "Only include fields you have values for. Do NOT include fields with empty or unknown values.",
     );
   }
 
   lines.push(
-    "Instructions:",
-    "1. Analyse the full conversation history and any extracted bill text above.",
-    "2. Extract every field that has already been mentioned or visible in the bill text.",
-    "3. If AMOUNT is still missing or uncertain, ask for it.",
-    "4. Once you have at minimum: amount + a reasonable title, return status complete.",
-    "5. Ask only ONE short, friendly question at a time when collecting missing info.",
-    "6. Be concise and warm in tone.",
     "",
-    "IMPORTANT: Return ONLY raw JSON. No markdown, no code fences, no extra text.",
+    "Rules: Ask ONE short question at a time. Do NOT return complete until you have: amount, title, specific destination, AND for travel: both trip_from and trip_to. Also ensure all REQUIRED custom fields (if any) for the detected category are filled before completing.",
     "",
-    "If you still need information:",
-    '{"status": "collecting", "question": "Your single friendly question here"}',
-    "",
-    "When you have enough information (at minimum: amount and title):",
-    '{"status": "complete", "expense": {"title": "...", "destination": "...", "amount": 1234, "category": "food", "expense_date": "YYYY-MM-DD", "purpose": "..."}}',
+    "Output ONLY raw JSON — no markdown, no code fences:",
+    'Need info → {"status":"collecting","question":"..."}',
+    `Travel done → {"status":"complete","expense":{"title":"Driver Hire","destination":"Ahmedabad to Surat","trip_from":"Ahmedabad","trip_to":"Surat","amount":1200,"category":"travel","expense_date":"${today}","purpose":null,"custom_fields":{"Vehicle Number":"MH-01-AB-1234"}}}`,
+    `Food done → {"status":"complete","expense":{"title":"Dinner at Cafe","destination":"Cafe Name","trip_from":null,"trip_to":null,"amount":450,"category":"food","expense_date":"${today}","purpose":null}}`,
   );
 
   return lines.join("\n");
@@ -217,23 +453,16 @@ function buildSystemInstruction(today: string, ocrText?: string): string {
 // We run a dedicated OCR prompt first to pull raw text, then feed that into the
 // conversational context so the parser has a clean text signal to work from.
 
-const OCR_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-flash-latest"];
+/** Single fast OCR attempt (+ one backup) to save latency; main chat still sees the image. */
+const OCR_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash"];
 
 async function extractTextFromImage(
   apiKey: string,
   image: { data: string; mimeType: string },
 ): Promise<string> {
   const ocrPrompt = [
-    "Carefully examine this bill or receipt image.",
-    "It may be printed, typed, or entirely handwritten.",
-    "Your only job is to extract ALL text and numbers you can see.",
-    "",
-    "Instructions:",
-    "- Read every line, including handwritten text.",
-    "- If handwriting is unclear, give your best interpretation followed by a '?' (e.g. '500?').",
-    "- Include: amounts, totals, dates, vendor/shop name, item names, taxes, any numbers.",
-    "- Output ONLY the raw extracted text, line by line.",
-    "- Do NOT add any explanation or commentary.",
+    "Extract all visible text and numbers from this receipt/bill (printed or handwritten).",
+    "Uncertain digits: add '?'. Lines only, no commentary.",
   ].join("\n");
 
   const baseUrl = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -245,6 +474,7 @@ async function extractTextFromImage(
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS),
           body: JSON.stringify({
             contents: [
               {
@@ -255,18 +485,27 @@ async function extractTextFromImage(
                 ],
               },
             ],
-            generationConfig: { temperature: 0, maxOutputTokens: 600 },
+            generationConfig: { temperature: 0, maxOutputTokens: 512 },
           }),
         },
       );
 
       if (response.ok) {
         const body = await response.json();
+        const blocked = geminiBlockedReason(body);
+        if (blocked) continue;
         const text = extractGeminiText(body);
         if (text) return text;
+      } else if (response.status === 429) {
+        const t = await response.text().catch(() => "");
+        console.warn("[parse-expense] Gemini 429 (OCR), configured key prefix:", apiKey.slice(0, 10));
+        if (isHardGeminiQuotaExceeded(t)) {
+          throw new GeminiQuotaExceededError(t.slice(0, 300));
+        }
       }
-    } catch {
-      // silently try next model
+    } catch (e) {
+      if (e instanceof GeminiQuotaExceededError) throw e;
+      // try next model
     }
   }
 
@@ -278,17 +517,18 @@ async function extractTextFromImage(
 async function callGeminiLegacy(apiKey: string, message: string) {
   const prompt = buildLegacyPrompt(message);
   const baseUrl = "https://generativelanguage.googleapis.com/v1beta/models";
-  const retryableStatus = new Set([429, 500, 502, 503, 504]);
+  const retryOnce = new Set([503, 504]);
   const errors: string[] = [];
 
-  for (const model of GEMINI_MODELS) {
-    for (let attempt = 0; attempt <= 2; attempt++) {
+  for (const model of GEMINI_LEGACY_MODELS) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const response = await fetch(
           `${baseUrl}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS),
             body: JSON.stringify({
               contents: [{ role: "user", parts: [{ text: prompt }] }],
               generationConfig: { temperature: 0.1, maxOutputTokens: 500 },
@@ -298,6 +538,11 @@ async function callGeminiLegacy(apiKey: string, message: string) {
 
         if (response.ok) {
           const body = await response.json();
+          const blocked = geminiBlockedReason(body);
+          if (blocked) {
+            errors.push(`${model}: ${blocked}`);
+            break;
+          }
           const text = extractGeminiText(body);
           if (!text) { errors.push(`${model}: empty response`); break; }
           return { model, text };
@@ -305,64 +550,201 @@ async function callGeminiLegacy(apiKey: string, message: string) {
 
         if (response.status === 404) { errors.push(`${model}: not found`); break; }
 
-        if (retryableStatus.has(response.status) && attempt < 2) {
-          await sleep(400 * (attempt + 1));
+        if (response.status === 429) {
+          const failText = await response.text().catch(() => "");
+          console.warn("[parse-expense] Gemini 429 (legacy), configured key prefix:", apiKey.slice(0, 10));
+          if (isHardGeminiQuotaExceeded(failText)) {
+            throw new GeminiQuotaExceededError(failText.slice(0, 300));
+          }
+          if (attempt === 0) {
+            await sleep(2200);
+            continue;
+          }
+          if (attempt === 1) {
+            await sleep(5500);
+            continue;
+          }
+          errors.push(`${model}: 429 ${parseGeminiErrorMessage(failText).slice(0, 120)}`);
+          break;
+        }
+
+        if (retryOnce.has(response.status) && attempt === 0) {
+          await sleep(500);
           continue;
         }
 
         const failText = await response.text().catch(() => "");
         errors.push(`${model}: ${response.status} ${failText.slice(0, 160)}`);
         break;
-      } catch {
-        if (attempt < 2) { await sleep(400 * (attempt + 1)); continue; }
+      } catch (e) {
+        if (e instanceof GeminiQuotaExceededError) throw e;
+        const name = e instanceof Error ? e.name : "";
+        if ((name === "TimeoutError" || name === "AbortError") && attempt === 0) {
+          errors.push(`${model}: timeout`);
+          break;
+        }
+        if (attempt === 0) { await sleep(400); continue; }
         errors.push(`${model}: network error`);
+        break;
       }
     }
   }
 
-  throw new Error(`All Gemini models failed. ${errors.join(" | ")}`);
+  const legacyJoined = errors.join(" | ");
+  if (/\b429\b/.test(legacyJoined)) {
+    if (isHardGeminiQuotaExceeded(legacyJoined)) {
+      throw new GeminiQuotaExceededError(legacyJoined.slice(0, 400));
+    }
+    throw new GeminiRateLimitedError(legacyJoined.slice(0, 400));
+  }
+
+  throw new Error(`All Gemini models failed. ${legacyJoined}`);
+}
+
+function conversationalModelOrder(): string[] {
+  const pinned =
+    Deno.env.get("GEMINI_CONVERSATIONAL_MODEL")?.trim() ||
+    Deno.env.get("GEMINI_MODEL")?.trim();
+  if (pinned) return [pinned];
+  const useFallback = Deno.env.get("GEMINI_USE_PRO_FALLBACK") === "1";
+  return useFallback
+    ? [...GEMINI_CONVERSATIONAL_FLASH, ...GEMINI_CONVERSATIONAL_FALLBACK]
+    : [...GEMINI_CONVERSATIONAL_FLASH];
+}
+
+function trimConversation(messages: ConversationMessage[]): ConversationMessage[] {
+  if (messages.length <= MAX_CONVERSATION_MESSAGES) return messages;
+  return messages.slice(-MAX_CONVERSATION_MESSAGES);
+}
+
+const ASK_DESTINATION_QUESTION =
+  "Where was this — which restaurant, shop, city, or neighbourhood?";
+const ASK_TRAVEL_FROM_TO_QUESTION =
+  "Where did you travel from, and where to?";
+
+function getMissingRequiredCustomFields(expense: ParsedExpense, orgFormSchema?: OrgFormSchema): string[] {
+  if (!orgFormSchema) return [];
+  const catFields = orgFormSchema[expense.category];
+  if (!catFields?.length) return [];
+  const filled = expense.custom_fields || {};
+  return catFields
+    .filter((f) => f.required)
+    .filter((f) => {
+      const val = filled[f.name];
+      return !val || !val.trim();
+    })
+    .map((f) => f.name);
+}
+
+function parseConversationalGeminiJson(
+  text: string,
+  model: string,
+  errors: string[],
+  orgFormSchema?: OrgFormSchema,
+): ConversationalResponse | null {
+  const parsed = parseJsonFromModelText(text);
+  if (!parsed) {
+    errors.push(`${model}: JSON parse failed`);
+    return null;
+  }
+
+  if (parsed.status === "collecting" && typeof parsed.question === "string") {
+    return { status: "collecting", question: parsed.question };
+  }
+
+  if (parsed.status === "complete" && parsed.expense) {
+    const expense = normalizeParsedExpense(parsed.expense, "Expense");
+    // For travel: require both trip_from and trip_to before completing
+    if (expense.category === "travel" && (!expense.trip_from || !expense.trip_to)) {
+      return { status: "collecting", question: ASK_TRAVEL_FROM_TO_QUESTION };
+    }
+    if (isDestinationUnset(expense.destination)) {
+      return { status: "collecting", question: ASK_DESTINATION_QUESTION };
+    }
+    // Check required custom fields
+    const missingCustom = getMissingRequiredCustomFields(expense, orgFormSchema);
+    if (missingCustom.length > 0) {
+      const fieldList = missingCustom.join(", ");
+      return {
+        status: "collecting",
+        question: missingCustom.length === 1
+          ? `I also need: what is the ${fieldList}?`
+          : `I still need a few details: ${fieldList}. Could you provide these?`,
+      };
+    }
+    return { status: "complete", expense };
+  }
+
+  const normalized = normalizeParsedExpense(parsed, "Expense");
+  if (normalized.amount !== null) {
+    if (normalized.category === "travel" && (!normalized.trip_from || !normalized.trip_to)) {
+      return { status: "collecting", question: ASK_TRAVEL_FROM_TO_QUESTION };
+    }
+    if (isDestinationUnset(normalized.destination)) {
+      return { status: "collecting", question: ASK_DESTINATION_QUESTION };
+    }
+    const missingCustom = getMissingRequiredCustomFields(normalized, orgFormSchema);
+    if (missingCustom.length > 0) {
+      const fieldList = missingCustom.join(", ");
+      return {
+        status: "collecting",
+        question: missingCustom.length === 1
+          ? `I also need: what is the ${fieldList}?`
+          : `I still need a few details: ${fieldList}. Could you provide these?`,
+      };
+    }
+    return { status: "complete", expense: normalized };
+  }
+
+  return {
+    status: "collecting",
+    question: normalized.missingInfo || "What was the total amount spent?",
+  };
 }
 
 async function callGeminiConversational(
   apiKey: string,
   messages: ConversationMessage[],
   image?: { data: string; mimeType: string },
+  orgFormSchema?: OrgFormSchema,
 ): Promise<ConversationalResponse> {
   const today = new Date().toISOString().slice(0, 10);
+  const recentMessages = trimConversation(messages);
 
-  // ── OCR pre-pass for bill images (handles handwritten bills) ──────────────
-  // Run a dedicated text-extraction prompt before the main conversation call.
-  // The extracted text is injected into the system instruction so the parser
-  // always has a clean textual signal even when handwriting is involved.
+  // OCR pre-pass only with image (short path — max 2 small models)
   let ocrText: string | undefined;
   if (image) {
     ocrText = await extractTextFromImage(apiKey, image);
   }
 
-  const systemInstruction = buildSystemInstruction(today, ocrText);
+  const systemInstruction = buildSystemInstruction(today, ocrText, orgFormSchema);
   const baseUrl = "https://generativelanguage.googleapis.com/v1beta/models";
-  const retryableStatus = new Set([429, 500, 502, 503, 504]);
 
-  // Build Gemini contents array
   const contents: any[] = [];
 
-  // Always include the raw image too so Gemini can cross-reference visually,
-  // but the OCR text in systemInstruction is the primary text signal.
   if (image) {
     contents.push({
       role: "user",
       parts: [
         { inline_data: { mime_type: image.mimeType, data: image.data } },
-        { text: ocrText ? "Here is the bill image (OCR text is provided separately)." : "Here is the bill or receipt image." },
+        {
+          text: ocrText
+            ? "Bill image (OCR in system instruction)."
+            : "Bill / receipt image.",
+        },
       ],
     });
     contents.push({
       role: "model",
-      parts: [{ text: ocrText ? "Got it. I've read the extracted text from your bill and will use it to fill the expense." : "I can see the bill. I'll extract the expense details from it." }],
+      parts: [{
+        text: ocrText
+          ? "Using extracted bill text from system prompt."
+          : "Reviewing the bill image.",
+      }],
     });
   }
 
-  for (const msg of messages) {
+  for (const msg of recentMessages) {
     contents.push({
       role: msg.role === "assistant" ? "model" : "user",
       parts: [{ text: msg.content || "(no text)" }],
@@ -370,78 +752,105 @@ async function callGeminiConversational(
   }
 
   const errors: string[] = [];
+  const models = conversationalModelOrder();
+  /** Quota hits the API key — don't burn time cycling every model. */
+  const retryTransient = new Set([503, 504]);
 
-  for (const model of GEMINI_MODELS) {
-    for (let attempt = 0; attempt <= 2; attempt++) {
+  for (const model of models) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const response = await fetch(
           `${baseUrl}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS),
             body: JSON.stringify({
               systemInstruction: { parts: [{ text: systemInstruction }] },
               contents,
-              generationConfig: { temperature: 0.1, maxOutputTokens: 400 },
+              generationConfig: {
+                temperature: 0.05,
+                // Vision + JSON needs headroom; truncated output breaks JSON.parse.
+                maxOutputTokens: image ? 1024 : 450,
+              },
             }),
           },
         );
 
         if (response.ok) {
           const body = await response.json();
-          const text = extractGeminiText(body);
-          if (!text) { errors.push(`${model}: empty response`); break; }
-
-          let parsed: any;
-          try {
-            parsed = JSON.parse(cleanupJsonText(text));
-          } catch {
-            errors.push(`${model}: JSON parse failed`);
+          const blocked = geminiBlockedReason(body);
+          if (blocked) {
+            errors.push(`${model}: ${blocked}`);
             break;
           }
-
-          if (parsed.status === "collecting" && typeof parsed.question === "string") {
-            return { status: "collecting", question: parsed.question };
+          const text = extractGeminiText(body);
+          if (!text) {
+            errors.push(`${model}: empty response`);
+            break;
           }
-
-          if (parsed.status === "complete" && parsed.expense) {
-            return {
-              status: "complete",
-              expense: normalizeParsedExpense(parsed.expense, "Expense"),
-            };
-          }
-
-          // Gemini didn't follow the new schema – treat as a legacy expense blob
-          const normalized = normalizeParsedExpense(parsed, "Expense");
-          if (normalized.amount !== null) {
-            return { status: "complete", expense: normalized };
-          }
-
-          // Still missing amount – treat as collecting
-          return {
-            status: "collecting",
-            question: normalized.missingInfo || "What was the total amount spent?",
-          };
+          const parsed = parseConversationalGeminiJson(text, model, errors, orgFormSchema);
+          if (parsed) return parsed;
+          break;
         }
 
-        if (response.status === 404) { errors.push(`${model}: not found`); break; }
+        if (response.status === 404) {
+          errors.push(`${model}: not found`);
+          break;
+        }
 
-        if (retryableStatus.has(response.status) && attempt < 2) {
-          await sleep(400 * (attempt + 1));
+        if (response.status === 429) {
+          const failText = await response.text().catch(() => "");
+          console.warn("[parse-expense] Gemini 429 (chat), configured key prefix:", apiKey.slice(0, 10));
+          if (isHardGeminiQuotaExceeded(failText)) {
+            throw new GeminiQuotaExceededError(failText.slice(0, 300));
+          }
+          if (attempt === 0) {
+            await sleep(2200);
+            continue;
+          }
+          if (attempt === 1) {
+            await sleep(5500);
+            continue;
+          }
+          errors.push(`${model}: 429 ${parseGeminiErrorMessage(failText).slice(0, 120)}`);
+          break;
+        }
+
+        if (retryTransient.has(response.status) && attempt === 0) {
+          await sleep(450);
           continue;
         }
 
         const failText = await response.text().catch(() => "");
         errors.push(`${model}: ${response.status} ${failText.slice(0, 160)}`);
         break;
-      } catch {
-        if (attempt < 2) { await sleep(400 * (attempt + 1)); continue; }
+      } catch (e) {
+        if (e instanceof GeminiQuotaExceededError) throw e;
+        const name = e instanceof Error ? e.name : "";
+        if (name === "TimeoutError" || name === "AbortError") {
+          errors.push(`${model}: timeout`);
+          break;
+        }
+        if (attempt === 0) {
+          await sleep(350);
+          continue;
+        }
         errors.push(`${model}: network error`);
+        break;
       }
     }
   }
 
-  throw new Error(`All Gemini models failed. ${errors.join(" | ")}`);
+  const joined = errors.join(" | ");
+  if (/\b429\b/.test(joined)) {
+    if (isHardGeminiQuotaExceeded(joined)) {
+      throw new GeminiQuotaExceededError(joined.slice(0, 400));
+    }
+    throw new GeminiRateLimitedError(joined.slice(0, 400));
+  }
+
+  throw new Error(`All Gemini models failed. ${joined}`);
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
@@ -505,16 +914,39 @@ Deno.serve(async (req) => {
         if (typeof data !== "string" || typeof mimeType !== "string") {
           return json(400, { error: "INVALID_BODY", message: "image must have data and mimeType string fields." });
         }
-        if (data.length > MAX_IMAGE_BYTES) {
-          return json(400, { error: "INVALID_BODY", message: "Image is too large. Please use an image smaller than 4 MB." });
+        if (approxDecodedBase64Bytes(data) > MAX_IMAGE_BINARY_BYTES) {
+          return json(400, {
+            error: "INVALID_BODY",
+            message: "Image is too large. Please use a photo under 4 MB or send a smaller shot.",
+          });
         }
-        image = { data, mimeType };
+        image = { data, mimeType: normalizeImageMimeType(mimeType) };
       }
 
+      // Extract org form schema if provided (custom fields per category)
+      const orgFormSchema: OrgFormSchema | undefined =
+        body.orgFormSchema && typeof body.orgFormSchema === "object"
+          ? (body.orgFormSchema as OrgFormSchema)
+          : undefined;
+
       try {
-        const result = await callGeminiConversational(apiKey, messages, image);
+        const result = await callGeminiConversational(apiKey, messages, image, orgFormSchema);
         return json(200, result as unknown as Record<string, unknown>);
       } catch (err) {
+        if (err instanceof GeminiQuotaExceededError) {
+          return json(503, {
+            error: "GEMINI_QUOTA_EXCEEDED",
+            message: USER_MESSAGE_GEMINI_QUOTA,
+            details: err.message.slice(0, 400),
+          });
+        }
+        if (err instanceof GeminiRateLimitedError) {
+          return json(503, {
+            error: "GEMINI_RATE_LIMIT",
+            message: USER_MESSAGE_GEMINI_RATE_LIMIT,
+            details: err.message.slice(0, 400),
+          });
+        }
         const msg = err instanceof Error ? err.message : "Gemini request failed.";
         return json(502, { error: "GEMINI_FAILURE", message: "AI parsing failed. Please try again.", details: msg.slice(0, 400) });
       }
@@ -538,6 +970,20 @@ Deno.serve(async (req) => {
       const gemini = await callGeminiLegacy(apiKey, message);
       parsed = JSON.parse(cleanupJsonText(gemini.text));
     } catch (err) {
+      if (err instanceof GeminiQuotaExceededError) {
+        return json(503, {
+          error: "GEMINI_QUOTA_EXCEEDED",
+          message: USER_MESSAGE_GEMINI_QUOTA,
+          details: err.message.slice(0, 400),
+        });
+      }
+      if (err instanceof GeminiRateLimitedError) {
+        return json(503, {
+          error: "GEMINI_RATE_LIMIT",
+          message: USER_MESSAGE_GEMINI_RATE_LIMIT,
+          details: err.message.slice(0, 400),
+        });
+      }
       const messageText = err instanceof Error ? err.message : "Gemini request failed.";
       if (messageText.toLowerCase().includes("json")) {
         return json(422, { error: "INVALID_AI_RESPONSE", message: "AI returned malformed structured data." });
